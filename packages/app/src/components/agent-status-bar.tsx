@@ -16,7 +16,7 @@ import {
   type StyleProp,
   type ViewStyle,
 } from "react-native";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet, useUnistyles, withUnistyles } from "react-native-unistyles";
 import { useShallow } from "zustand/shallow";
 import { useStoreWithEqualityFn } from "zustand/traditional";
 import {
@@ -58,6 +58,7 @@ import type {
 } from "@server/server/agent/agent-sdk-types";
 import type { AgentProviderDefinition } from "@server/server/agent/provider-manifest";
 import { getModeVisuals, type AgentModeColorTier } from "@server/server/agent/provider-manifest";
+import type { Theme } from "@/styles/theme";
 import {
   getFeatureHighlightColor,
   getFeatureTooltip,
@@ -182,6 +183,21 @@ const MODE_ICONS = {
   ShieldAlert,
   ShieldOff,
   ShieldQuestionMark,
+} as const;
+const ThemedShieldCheck = withUnistyles(ShieldCheck);
+const ThemedShieldAlert = withUnistyles(ShieldAlert);
+const ThemedShieldOff = withUnistyles(ShieldOff);
+const ThemedShieldQuestionMark = withUnistyles(ShieldQuestionMark);
+
+const foregroundColorMapping = (theme: Theme) => ({
+  color: theme.colors.foreground,
+});
+
+const MODE_MENU_LEADING_ICONS = {
+  ShieldCheck: <ThemedShieldCheck size={16} uniProps={foregroundColorMapping} />,
+  ShieldAlert: <ThemedShieldAlert size={16} uniProps={foregroundColorMapping} />,
+  ShieldOff: <ThemedShieldOff size={16} uniProps={foregroundColorMapping} />,
+  ShieldQuestionMark: <ThemedShieldQuestionMark size={16} uniProps={foregroundColorMapping} />,
 } as const;
 
 function alwaysTrue() {
@@ -1135,6 +1151,7 @@ function SheetStatusBarContent(props: SheetStatusBarContentProps) {
     onToggleFavoriteModel,
     onDropdownClose,
     onModelSelectorOpen,
+    providerDefinitions,
     favoriteKeys,
     disabled,
     isModelLoading,
@@ -1260,6 +1277,8 @@ function SheetStatusBarContent(props: SheetStatusBarContentProps) {
                   <ModeMenuItem
                     key={mode.id}
                     mode={mode}
+                    provider={provider}
+                    providerDefinitions={providerDefinitions}
                     selected={mode.id === selectedModeId}
                     onSelectMode={onSelectMode}
                   />
@@ -1592,19 +1611,25 @@ function ModeComboboxOption({
 
 function ModeMenuItem({
   mode,
+  provider,
+  providerDefinitions,
   selected,
   onSelectMode,
 }: {
   mode: StatusOption;
+  provider: string;
+  providerDefinitions: AgentProviderDefinition[];
   selected: boolean;
   onSelectMode?: (modeId: string) => void;
 }) {
+  const visuals = getModeVisuals(provider, mode.id, providerDefinitions);
+  const leadingIcon = visuals?.icon ? MODE_MENU_LEADING_ICONS[visuals.icon] : null;
   const handleSelect = useCallback(() => {
     onSelectMode?.(mode.id);
   }, [mode.id, onSelectMode]);
 
   return (
-    <DropdownMenuItem selected={selected} onSelect={handleSelect}>
+    <DropdownMenuItem selected={selected} onSelect={handleSelect} leading={leadingIcon}>
       {mode.label}
     </DropdownMenuItem>
   );
