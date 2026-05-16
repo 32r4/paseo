@@ -1135,7 +1135,6 @@ function SheetStatusBarContent(props: SheetStatusBarContentProps) {
     onToggleFavoriteModel,
     onDropdownClose,
     onModelSelectorOpen,
-    providerDefinitions,
     favoriteKeys,
     disabled,
     isModelLoading,
@@ -1261,8 +1260,6 @@ function SheetStatusBarContent(props: SheetStatusBarContentProps) {
                   <ModeMenuItem
                     key={mode.id}
                     mode={mode}
-                    provider={provider}
-                    providerDefinitions={providerDefinitions}
                     selected={mode.id === selectedModeId}
                     onSelectMode={onSelectMode}
                   />
@@ -1595,32 +1592,19 @@ function ModeComboboxOption({
 
 function ModeMenuItem({
   mode,
-  provider,
-  providerDefinitions,
   selected,
   onSelectMode,
 }: {
   mode: StatusOption;
-  provider: string;
-  providerDefinitions: AgentProviderDefinition[];
   selected: boolean;
   onSelectMode?: (modeId: string) => void;
 }) {
-  const { theme } = useUnistyles();
-  const visuals = getModeVisuals(provider, mode.id, providerDefinitions);
-  const Icon = visuals?.icon ? MODE_ICONS[visuals.icon] : ShieldCheck;
-
   const handleSelect = useCallback(() => {
     onSelectMode?.(mode.id);
   }, [mode.id, onSelectMode]);
 
-  const leadingIcon = useMemo(
-    () => <Icon size={16} color={theme.colors.foreground} />,
-    [Icon, theme.colors.foreground],
-  );
-
   return (
-    <DropdownMenuItem selected={selected} onSelect={handleSelect} leading={leadingIcon}>
+    <DropdownMenuItem selected={selected} onSelect={handleSelect}>
       {mode.label}
     </DropdownMenuItem>
   );
