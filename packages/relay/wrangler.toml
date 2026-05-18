@@ -1,7 +1,7 @@
 name = "paseo-relay"
 account_id = "2cb0d6b66a3ff642d924842aa0a80806"
 main = "src/cloudflare-adapter.ts"
-compatibility_date = "2024-12-01"
+compatibility_date = "2026-05-18"
 
 routes = [{ pattern = "relay.32r4.asia", custom_domain = true }]
 
