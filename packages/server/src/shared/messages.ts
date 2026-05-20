@@ -114,6 +114,7 @@ export const MutableDaemonConfigSchema = z
       .passthrough(),
     providers: z.record(z.string(), MutableDaemonProviderConfigSchema).default({}),
     autoArchiveAfterMerge: z.boolean().default(false),
+    appendSystemPrompt: z.string().default(""),
   })
   .passthrough();
 
@@ -124,6 +125,7 @@ export const MutableDaemonConfigPatchSchema = z
       .record(z.string(), MutableDaemonProviderConfigSchema.partial().passthrough())
       .optional(),
     autoArchiveAfterMerge: z.boolean().optional(),
+    appendSystemPrompt: z.string().optional(),
   })
   .partial()
   .passthrough();
@@ -979,6 +981,16 @@ export const WaitForFinishRequestSchema = z.object({
   timeoutMs: z.number().int().positive().optional(),
 });
 
+export const DaemonGetStatusRequestSchema = z.object({
+  type: z.literal("daemon.get_status.request"),
+  requestId: z.string(),
+});
+
+export const DaemonGetPairingOfferRequestSchema = z.object({
+  type: z.literal("daemon.get_pairing_offer.request"),
+  requestId: z.string(),
+});
+
 export const GetDaemonConfigRequestMessageSchema = z.object({
   type: z.literal("get_daemon_config_request"),
   requestId: z.string(),
@@ -1046,9 +1058,28 @@ const GitSetupOptionsSchema = z.object({
 
 export type GitSetupOptions = z.infer<typeof GitSetupOptionsSchema>;
 
+export const CreateAgentWorktreeTargetSchema = z.discriminatedUnion("mode", [
+  z.object({
+    mode: z.literal("branch-off"),
+    newBranch: z.string().min(1),
+    base: z.string().min(1).optional(),
+  }),
+  z.object({
+    mode: z.literal("checkout-branch"),
+    branch: z.string().min(1),
+  }),
+  z.object({
+    mode: z.literal("checkout-pr"),
+    prNumber: z.number().int().positive(),
+  }),
+]);
+
+export type CreateAgentWorktreeTarget = z.infer<typeof CreateAgentWorktreeTargetSchema>;
+
 export const CreateAgentRequestMessageSchema = z.object({
   type: z.literal("create_agent_request"),
   config: AgentSessionConfigSchema,
+  env: z.record(z.string()).optional(),
   workspaceId: z.string().optional(),
   worktreeName: z.string().optional(),
   initialPrompt: z.string().optional(),
@@ -1057,6 +1088,8 @@ export const CreateAgentRequestMessageSchema = z.object({
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,
   git: GitSetupOptionsSchema.optional(),
+  worktree: CreateAgentWorktreeTargetSchema.optional(),
+  autoArchive: z.boolean().optional(),
   labels: z.record(z.string()).default({}),
   requestId: z.string(),
 });
@@ -1379,6 +1412,13 @@ export const CheckoutSwitchBranchRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const CheckoutRenameBranchRequestSchema = z.object({
+  type: z.literal("checkout.rename_branch.request"),
+  cwd: z.string(),
+  branch: z.string(),
+  requestId: z.string(),
+});
+
 export const StashSaveRequestSchema = z.object({
   type: z.literal("stash_save_request"),
   cwd: z.string(),
@@ -1696,6 +1736,13 @@ export const CreateTerminalRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const RenameTerminalRequestSchema = z.object({
+  type: z.literal("terminal.rename.request"),
+  terminalId: z.string(),
+  title: z.string(),
+  requestId: z.string(),
+});
+
 export const StartWorkspaceScriptRequestSchema = z.object({
   type: z.literal("start_workspace_script_request"),
   workspaceId: z.string(),
@@ -1764,6 +1811,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetVoiceModeMessageSchema,
   SendAgentMessageRequestSchema,
   WaitForFinishRequestSchema,
+  DaemonGetStatusRequestSchema,
+  DaemonGetPairingOfferRequestSchema,
   GetDaemonConfigRequestMessageSchema,
   SetDaemonConfigRequestMessageSchema,
   ReadProjectConfigRequestMessageSchema,
@@ -1806,6 +1855,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CheckoutPrStatusRequestSchema,
   PullRequestTimelineRequestSchema,
   CheckoutSwitchBranchRequestSchema,
+  CheckoutRenameBranchRequestSchema,
   StashSaveRequestSchema,
   StashPopRequestSchema,
   StashListRequestSchema,
@@ -1833,6 +1883,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SubscribeTerminalsRequestSchema,
   UnsubscribeTerminalsRequestSchema,
   CreateTerminalRequestSchema,
+  RenameTerminalRequestSchema,
   StartWorkspaceScriptRequestSchema,
   SubscribeTerminalRequestSchema,
   UnsubscribeTerminalRequestSchema,
@@ -2026,6 +2077,8 @@ export const ServerInfoStatusPayloadSchema = z
       .object({
         providersSnapshot: z.boolean().optional(),
         checkoutGithubSetAutoMerge: z.boolean().optional(),
+        // COMPAT(daemonStatusRpc): added in v0.1.76, remove gate after 2026-11-18.
+        daemonStatusRpc: z.boolean().optional(),
       })
       .optional(),
   })
@@ -2586,6 +2639,50 @@ export const GetDaemonConfigResponseMessageSchema = z.object({
     .passthrough(),
 });
 
+export const DaemonGetStatusResponseSchema = z.object({
+  type: z.literal("daemon.get_status.response"),
+  payload: z
+    .object({
+      requestId: z.string(),
+      serverId: z.string(),
+      version: z.string().nullable().optional(),
+      pid: z.number(),
+      nodePath: z.string(),
+      startedAt: z.string().nullable().optional(),
+      listen: z.string().nullable(),
+      relay: z
+        .object({
+          enabled: z.boolean(),
+          endpoint: z.string(),
+          publicEndpoint: z.string(),
+          useTls: z.boolean(),
+          publicUseTls: z.boolean(),
+        })
+        .nullable()
+        .optional(),
+      providers: z.array(
+        z.object({
+          provider: z.string(),
+          available: z.boolean(),
+          error: z.string().nullable().optional(),
+        }),
+      ),
+    })
+    .passthrough(),
+});
+
+export const DaemonGetPairingOfferResponseSchema = z.object({
+  type: z.literal("daemon.get_pairing_offer.response"),
+  payload: z
+    .object({
+      requestId: z.string(),
+      url: z.string(),
+      qr: z.string().nullable().optional(),
+      relayEnabled: z.boolean(),
+    })
+    .passthrough(),
+});
+
 export const SetDaemonConfigResponseMessageSchema = z.object({
   type: z.literal("set_daemon_config_response"),
   payload: z
@@ -3047,6 +3144,17 @@ export const CheckoutSwitchBranchResponseSchema = z.object({
   }),
 });
 
+export const CheckoutRenameBranchResponseSchema = z.object({
+  type: z.literal("checkout.rename_branch.response"),
+  payload: z.object({
+    requestId: z.string(),
+    success: z.boolean(),
+    cwd: z.string(),
+    currentBranch: z.string().nullable(),
+    error: CheckoutErrorSchema.nullable(),
+  }),
+});
+
 const StashEntrySchema = z.object({
   index: z.number().int().min(0),
   message: z.string(),
@@ -3401,6 +3509,15 @@ export const CreateTerminalResponseSchema = z.object({
   }),
 });
 
+export const RenameTerminalResponseSchema = z.object({
+  type: z.literal("terminal.rename.response"),
+  payload: z.object({
+    requestId: z.string(),
+    success: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const SubscribeTerminalResponseSchema = z.object({
   type: z.literal("subscribe_terminal_response"),
   payload: z.union([
@@ -3481,6 +3598,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ClearAgentAttentionResponseMessageSchema,
   SendAgentMessageResponseMessageSchema,
   SetVoiceModeResponseMessageSchema,
+  DaemonGetStatusResponseSchema,
+  DaemonGetPairingOfferResponseSchema,
   GetDaemonConfigResponseMessageSchema,
   SetDaemonConfigResponseMessageSchema,
   ReadProjectConfigResponseMessageSchema,
@@ -3512,6 +3631,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CheckoutPrStatusResponseSchema,
   PullRequestTimelineResponseSchema,
   CheckoutSwitchBranchResponseSchema,
+  CheckoutRenameBranchResponseSchema,
   StashSaveResponseSchema,
   StashPopResponseSchema,
   StashListResponseSchema,
@@ -3537,6 +3657,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ListTerminalsResponseSchema,
   TerminalsChangedSchema,
   CreateTerminalResponseSchema,
+  RenameTerminalResponseSchema,
   SubscribeTerminalResponseSchema,
   KillTerminalResponseSchema,
   CaptureTerminalResponseSchema,
@@ -3643,6 +3764,8 @@ export type ListProviderFeaturesResponseMessage = z.infer<
   typeof ListProviderFeaturesResponseMessageSchema
 >;
 export type ListAvailableProvidersResponse = z.infer<typeof ListAvailableProvidersResponseSchema>;
+export type DaemonGetStatusResponse = z.infer<typeof DaemonGetStatusResponseSchema>;
+export type DaemonGetPairingOfferResponse = z.infer<typeof DaemonGetPairingOfferResponseSchema>;
 export type GetProvidersSnapshotResponseMessage = z.infer<
   typeof GetProvidersSnapshotResponseMessageSchema
 >;
@@ -3782,6 +3905,8 @@ export type PullRequestTimelineItem = z.infer<typeof PullRequestTimelineItemSche
 export type PullRequestTimelineResponse = z.infer<typeof PullRequestTimelineResponseSchema>;
 export type CheckoutSwitchBranchRequest = z.infer<typeof CheckoutSwitchBranchRequestSchema>;
 export type CheckoutSwitchBranchResponse = z.infer<typeof CheckoutSwitchBranchResponseSchema>;
+export type CheckoutRenameBranchRequest = z.infer<typeof CheckoutRenameBranchRequestSchema>;
+export type CheckoutRenameBranchResponse = z.infer<typeof CheckoutRenameBranchResponseSchema>;
 export type StashSaveRequest = z.infer<typeof StashSaveRequestSchema>;
 export type StashSaveResponse = z.infer<typeof StashSaveResponseSchema>;
 export type StashPopRequest = z.infer<typeof StashPopRequestSchema>;
@@ -3835,6 +3960,8 @@ export type UnsubscribeTerminalsRequest = z.infer<typeof UnsubscribeTerminalsReq
 export type TerminalsChanged = z.infer<typeof TerminalsChangedSchema>;
 export type CreateTerminalRequest = z.infer<typeof CreateTerminalRequestSchema>;
 export type CreateTerminalResponse = z.infer<typeof CreateTerminalResponseSchema>;
+export type RenameTerminalRequest = z.infer<typeof RenameTerminalRequestSchema>;
+export type RenameTerminalResponse = z.infer<typeof RenameTerminalResponseSchema>;
 export type StartWorkspaceScriptRequest = z.infer<typeof StartWorkspaceScriptRequestSchema>;
 export type StartWorkspaceScriptResponse = z.infer<
   typeof StartWorkspaceScriptResponseMessageSchema

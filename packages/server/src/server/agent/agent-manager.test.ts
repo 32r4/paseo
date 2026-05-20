@@ -1,11 +1,12 @@
 import { expect, test, vi } from "vitest";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
-import { AgentManager } from "./agent-manager.js";
+import { AgentManager, type ManagedAgent } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
 import { PARENT_AGENT_ID_LABEL } from "../../shared/agent-labels.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
@@ -100,12 +101,15 @@ function expectArchivedAgentRecord(
 class TestAgentClient implements AgentClient {
   readonly provider = "codex" as const;
   readonly capabilities = TEST_CAPABILITIES;
+  readonly createdConfigs: AgentSessionConfig[] = [];
+  readonly resumeOverrides: Array<Partial<AgentSessionConfig> | undefined> = [];
 
   async isAvailable(): Promise<boolean> {
     return true;
   }
 
   async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    this.createdConfigs.push(config);
     return new TestAgentSession(config);
   }
 
@@ -135,10 +139,52 @@ class TestAgentClient implements AgentClient {
     config?: Partial<AgentSessionConfig>,
     _launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    this.resumeOverrides.push(config);
     return new TestAgentSession({
       provider: "codex",
       cwd: config?.cwd ?? process.cwd(),
+      daemonAppendSystemPrompt: config?.daemonAppendSystemPrompt,
     });
+  }
+}
+
+class EnvProbeAgentClient extends TestAgentClient {
+  probe: Promise<{ probe: string | null; agentId: string | null }> | null = null;
+
+  override async createSession(
+    config: AgentSessionConfig,
+    launchContext?: AgentLaunchContext,
+  ): Promise<AgentSession> {
+    const script = `
+      process.stdout.write(JSON.stringify({
+        probe: process.env.CHUNK14_PROBE ?? null,
+        agentId: process.env.PASEO_AGENT_ID ?? null
+      }));
+    `;
+    const child = spawn(process.execPath, ["-e", script], {
+      cwd: config.cwd,
+      env: { ...process.env, ...launchContext?.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    this.probe = new Promise((resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code !== 0) {
+          reject(new Error(`env probe exited ${code}: ${stderr}`));
+          return;
+        }
+        resolve(JSON.parse(stdout) as { probe: string | null; agentId: string | null });
+      });
+    });
+    return new TestAgentSession(config);
   }
 }
 
@@ -368,6 +414,40 @@ test("normalizeConfig injects the provider default model when omitted", async ()
   expect(snapshot.config.modeId).toBe("auto");
 });
 
+test("createAgent forwards request env into the spawned provider process", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-env-test-"));
+  const client = new EnvProbeAgentClient();
+  const manager = new AgentManager({
+    clients: {
+      codex: client,
+    },
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-00000000e001",
+  });
+
+  try {
+    await manager.createAgent(
+      {
+        provider: "codex",
+        cwd: workdir,
+      },
+      undefined,
+      {
+        env: {
+          CHUNK14_PROBE: "expected",
+        },
+      },
+    );
+
+    await expect(client.probe).resolves.toEqual({
+      probe: "expected",
+      agentId: "00000000-0000-4000-8000-00000000e001",
+    });
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("normalizeConfig strips legacy 'default' model id", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
@@ -389,6 +469,62 @@ test("normalizeConfig strips legacy 'default' model id", async () => {
 
   expect(snapshot.config.model).toBe("gpt-5.4");
   expect(snapshot.config.modeId).toBe("auto");
+});
+
+test("createAgent injects daemon append system prompt at runtime only", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({
+    clients: {
+      codex: client,
+    },
+    registry: storage,
+    logger,
+    appendSystemPrompt: "  Daemon instructions.  ",
+    idFactory: () => "00000000-0000-4000-8000-000000000103",
+  });
+
+  const snapshot = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+    systemPrompt: "Agent instructions.",
+  });
+  const record = await storage.get(snapshot.id);
+
+  expect(client.createdConfigs[0]?.systemPrompt).toBe("Agent instructions.");
+  expect(client.createdConfigs[0]?.daemonAppendSystemPrompt).toBe("Daemon instructions.");
+  expect(snapshot.config.daemonAppendSystemPrompt).toBe("Daemon instructions.");
+  expect(record?.config?.systemPrompt).toBe("Agent instructions.");
+  expect(record?.config).not.toHaveProperty("daemonAppendSystemPrompt");
+});
+
+test("daemon append system prompt is injected into Pi configs", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({
+    clients: {
+      pi: client as unknown as AgentClient,
+    },
+    providerDefinitions: {
+      pi: { enabled: true },
+    },
+    registry: storage,
+    logger,
+    appendSystemPrompt: "Daemon instructions.",
+    idFactory: () => "00000000-0000-4000-8000-000000000104",
+  });
+
+  await manager.createAgent({
+    provider: "pi",
+    cwd: workdir,
+    systemPrompt: "Agent instructions.",
+  });
+
+  expect(client.createdConfigs[0]?.daemonAppendSystemPrompt).toBe("Daemon instructions.");
 });
 
 test("setAgentMode persists the selected mode across session reload", async () => {
@@ -1455,6 +1591,111 @@ test("setTitle bumps updatedAt and persists title in the same snapshot write", a
   const live = manager.getAgent(snapshot.id);
   expect(live).not.toBeNull();
   expect(live!.updatedAt.getTime()).toBeGreaterThan(Date.parse(before!.updatedAt));
+});
+
+test("setGeneratedTitleIfUnset preserves an existing user title", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-generated-title-preserve-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new TestAgentClient(),
+    },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000128",
+  });
+
+  const snapshot = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+  });
+
+  await manager.setTitle(snapshot.id, "User title");
+  await manager.setGeneratedTitleIfUnset(snapshot.id, "Generated title");
+
+  const after = await storage.get(snapshot.id);
+  expect(after?.title).toBe("User title");
+});
+
+test("setGeneratedTitleIfUnset persists generated title when no title exists", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-generated-title-empty-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new TestAgentClient(),
+    },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000129",
+  });
+
+  const snapshot = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+  });
+
+  await manager.setGeneratedTitleIfUnset(snapshot.id, "Generated title");
+
+  const after = await storage.get(snapshot.id);
+  expect(after?.title).toBe("Generated title");
+});
+
+test("setGeneratedTitleIfUnset ignores blank generated titles", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-generated-title-blank-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new TestAgentClient(),
+    },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000130",
+  });
+
+  const snapshot = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+  });
+  const before = await storage.get(snapshot.id);
+  expect(before).not.toBeNull();
+
+  const stateEvents: ManagedAgent[] = [];
+  manager.subscribe(
+    (event) => {
+      if (event.type === "agent_state") {
+        stateEvents.push(event.agent);
+      }
+    },
+    { agentId: snapshot.id, replayState: false },
+  );
+
+  await manager.setGeneratedTitleIfUnset(snapshot.id, "   ");
+
+  const after = await storage.get(snapshot.id);
+  expect(after?.title).toBeNull();
+  expect(after?.updatedAt).toBe(before?.updatedAt);
+  expect(manager.getAgent(snapshot.id)?.updatedAt.toISOString()).toBe(before?.updatedAt);
+  expect(stateEvents).toEqual([]);
+});
+
+test("setGeneratedTitleIfUnset throws for an unknown agent", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-generated-title-unknown-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new TestAgentClient(),
+    },
+    registry: storage,
+    logger,
+  });
+
+  await expect(
+    manager.setGeneratedTitleIfUnset("00000000-0000-4000-8000-000000000999", "Generated title"),
+  ).rejects.toThrow("Unknown agent '00000000-0000-4000-8000-000000000999'");
 });
 
 test("persists live mode, model, and thinking changes without an external snapshot subscriber", async () => {

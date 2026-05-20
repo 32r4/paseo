@@ -315,12 +315,12 @@ function SendButtonContent({
   buttonIconSize: number;
 }) {
   if (isSubmitLoading) {
-    return <ActivityIndicator size="small" color="white" />;
+    return <ThemedActivityIndicator size="small" uniProps={iconAccentForegroundMapping} />;
   }
   if (submitIcon === "return") {
-    return <CornerDownLeft size={buttonIconSize} color="white" />;
+    return <ThemedCornerDownLeft size={buttonIconSize} uniProps={iconAccentForegroundMapping} />;
   }
-  return <ArrowUp size={buttonIconSize} color="white" />;
+  return <ThemedArrowUp size={buttonIconSize} uniProps={iconAccentForegroundMapping} />;
 }
 
 function resolveSubmitAccessibilityLabel(input: {
@@ -799,6 +799,7 @@ interface ToggleRealtimeVoiceContext {
   voiceAgentId: string | undefined;
   isConnected: boolean;
   disabled: boolean;
+  isAgentRunning: boolean;
   handleStopRealtimeVoice: () => Promise<unknown> | void;
   toast: { error: (msg: string) => void };
 }
@@ -810,6 +811,10 @@ function toggleRealtimeVoiceImpl(ctx: ToggleRealtimeVoiceContext): void {
   if (ctx.voice.isVoiceSwitching) return;
   if (ctx.voice.isVoiceModeForAgent(ctx.voiceServerId, ctx.voiceAgentId)) {
     void ctx.handleStopRealtimeVoice();
+    return;
+  }
+  if (ctx.isAgentRunning) {
+    ctx.toast.error("Interrupt the agent before starting voice mode");
     return;
   }
   void ctx.voice.startVoice(ctx.voiceServerId, ctx.voiceAgentId).catch((error) => {
@@ -1450,10 +1455,20 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         voiceAgentId,
         isConnected,
         disabled,
+        isAgentRunning,
         handleStopRealtimeVoice,
         toast,
       });
-    }, [disabled, handleStopRealtimeVoice, isConnected, toast, voice, voiceAgentId, voiceServerId]);
+    }, [
+      disabled,
+      handleStopRealtimeVoice,
+      isAgentRunning,
+      isConnected,
+      toast,
+      voice,
+      voiceAgentId,
+      voiceServerId,
+    ]);
 
     const minimizeInputHeight = useCallback(() => {
       inputHeightRef.current = MIN_INPUT_HEIGHT;
@@ -1962,10 +1977,14 @@ const styles = StyleSheet.create((theme: Theme) => ({
 const ThemedPlus = withUnistyles(Plus);
 const ThemedMic = withUnistyles(Mic);
 const ThemedMicOff = withUnistyles(MicOff);
+const ThemedArrowUp = withUnistyles(ArrowUp);
+const ThemedCornerDownLeft = withUnistyles(CornerDownLeft);
+const ThemedActivityIndicator = withUnistyles(ActivityIndicator);
 const ThemedTextInput = withUnistyles(TextInput);
 
 const iconForegroundMapping = (theme: Theme) => ({ color: theme.colors.foreground });
 const iconForegroundMutedMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
+const iconAccentForegroundMapping = (theme: Theme) => ({ color: theme.colors.accentForeground });
 const textInputPlaceholderColorMapping = (theme: Theme) => ({
   placeholderTextColor: theme.colors.surface4,
 });

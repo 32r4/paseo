@@ -173,6 +173,7 @@ export interface AgentManagerOptions {
   durableTimelineStore?: AgentTimelineStore;
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
+  appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
   logger: Logger;
@@ -438,6 +439,7 @@ export class AgentManager {
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
+  private appendSystemPrompt: string;
   private onAgentAttention?: AgentAttentionCallback;
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
@@ -448,6 +450,7 @@ export class AgentManager {
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
+    this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
     this.rescueTimeouts = {
       reloadSessionCloseMs:
@@ -500,6 +503,10 @@ export class AgentManager {
 
   setMcpBaseUrl(url: string | null): void {
     this.mcpBaseUrl = url;
+  }
+
+  setAppendSystemPrompt(prompt: string | null | undefined): void {
+    this.appendSystemPrompt = prompt ?? "";
   }
 
   public getMetricsSnapshot(): AgentMetricsSnapshot {
@@ -798,6 +805,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       initialPrompt?: string;
+      env?: Record<string, string>;
       persistSession?: boolean;
     },
   ): Promise<ManagedAgent> {
@@ -816,8 +824,10 @@ export class AgentManager {
             },
           };
     this.requireEnabledProvider(injectedConfig.provider);
-    const normalizedConfig = await this.normalizeConfig(injectedConfig);
-    const launchContext = this.buildLaunchContext(resolvedAgentId);
+    const normalizedConfig = this.applyDaemonAppendSystemPrompt(
+      await this.normalizeConfig(injectedConfig),
+    );
+    const launchContext = this.buildLaunchContext(resolvedAgentId, options?.env);
     const client = await this.requireAvailableClient({
       provider: normalizedConfig.provider,
     });
@@ -860,7 +870,9 @@ export class AgentManager {
       ...overrides,
       provider: handle.provider,
     } as AgentSessionConfig;
-    const normalizedConfig = await this.normalizeConfig(mergedConfig);
+    const normalizedConfig = this.applyDaemonAppendSystemPrompt(
+      await this.normalizeConfig(mergedConfig),
+    );
     const resumeOverrides: Partial<AgentSessionConfig> = { ...overrides };
     let hasResumeOverrides = overrides !== undefined;
 
@@ -871,6 +883,11 @@ export class AgentManager {
 
     if (normalizedConfig.modeId !== mergedConfig.modeId) {
       resumeOverrides.modeId = normalizedConfig.modeId;
+      hasResumeOverrides = true;
+    }
+
+    if (metadata.daemonAppendSystemPrompt !== normalizedConfig.daemonAppendSystemPrompt) {
+      resumeOverrides.daemonAppendSystemPrompt = normalizedConfig.daemonAppendSystemPrompt;
       hasResumeOverrides = true;
     }
 
@@ -919,7 +936,9 @@ export class AgentManager {
       ...overrides,
       provider,
     } as AgentSessionConfig;
-    const normalizedConfig = await this.normalizeConfig(refreshConfig);
+    const normalizedConfig = this.applyDaemonAppendSystemPrompt(
+      await this.normalizeConfig(refreshConfig),
+    );
     const launchContext = this.buildLaunchContext(agentId);
 
     const session = handle
@@ -1055,6 +1074,7 @@ export class AgentManager {
     }
 
     const { archivedAt } = await this.markRecordArchived(stored);
+    agent.updatedAt = new Date(archivedAt);
     await this.closeAgent(agentId);
 
     await this.cascadeArchiveChildren(agentId);
@@ -1225,6 +1245,23 @@ export class AgentManager {
     }
     this.touchUpdatedAt(agent);
     await this.persistSnapshot(agent, { title: normalizedTitle });
+    this.emitState(agent, { persist: false });
+  }
+
+  async setGeneratedTitleIfUnset(agentId: string, title: string): Promise<void> {
+    const agent = this.requireAgent(agentId);
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) {
+      return;
+    }
+
+    const registry = this.requireRegistry();
+    const persisted = await registry.setGeneratedTitleIfUnset(agent.id, normalizedTitle);
+    if (!persisted) {
+      return;
+    }
+
+    agent.updatedAt = new Date(persisted.updatedAt);
     this.emitState(agent, { persist: false });
   }
 
@@ -3420,10 +3457,24 @@ export class AgentManager {
     return normalized;
   }
 
-  private buildLaunchContext(agentId: string): AgentLaunchContext {
+  private applyDaemonAppendSystemPrompt(config: AgentSessionConfig): AgentSessionConfig {
+    const daemonAppendSystemPrompt = this.appendSystemPrompt.trim();
+    const next = { ...config };
+    delete next.daemonAppendSystemPrompt;
+
+    return daemonAppendSystemPrompt
+      ? {
+          ...next,
+          daemonAppendSystemPrompt,
+        }
+      : next;
+  }
+
+  private buildLaunchContext(agentId: string, env?: Record<string, string>): AgentLaunchContext {
     return {
       agentId,
       env: {
+        ...env,
         PASEO_AGENT_ID: agentId,
       },
     };

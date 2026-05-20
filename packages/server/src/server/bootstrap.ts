@@ -230,6 +230,7 @@ export interface PaseoDaemonConfig {
   mcpEnabled?: boolean;
   mcpInjectIntoAgents?: boolean;
   autoArchiveAfterMerge?: boolean;
+  appendSystemPrompt?: string;
   staticDir: string;
   mcpDebug: boolean;
   isDev?: boolean;
@@ -290,6 +291,7 @@ export async function createPaseoDaemon(
         ]),
       ),
       autoArchiveAfterMerge: config.autoArchiveAfterMerge ?? false,
+      appendSystemPrompt: config.appendSystemPrompt ?? "",
     },
     logger,
   );
@@ -516,6 +518,7 @@ export async function createPaseoDaemon(
     },
     providerDefinitions: providerRegistry,
     registry: agentStorage,
+    appendSystemPrompt: config.appendSystemPrompt,
     logger,
   });
 
@@ -862,6 +865,9 @@ export async function createPaseoDaemon(
           daemonConfigStore.onFieldChange("mcp.injectIntoAgents", (value) => {
             agentManager.setMcpBaseUrl(value ? mcpBaseUrl : null);
           });
+          daemonConfigStore.onFieldChange("appendSystemPrompt", (value) => {
+            agentManager.setAppendSystemPrompt(typeof value === "string" ? value : "");
+          });
           const relayEnabled = config.relayEnabled ?? true;
           const relayEndpoint = config.relayEndpoint ?? "relay.paseo.sh:443";
           const relayPublicEndpoint = config.relayPublicEndpoint ?? relayEndpoint;
@@ -936,6 +942,16 @@ export async function createPaseoDaemon(
             workspaceGitService,
             github,
             config.pushNotificationSender,
+            {
+              listen: formatListenTarget(boundListenTarget ?? listenTarget),
+              relay: {
+                enabled: relayEnabled,
+                endpoint: relayEndpoint,
+                publicEndpoint: relayPublicEndpoint,
+                useTls: relayUseTls,
+                publicUseTls: relayPublicUseTls,
+              },
+            },
           );
 
           if (relayEnabled) {

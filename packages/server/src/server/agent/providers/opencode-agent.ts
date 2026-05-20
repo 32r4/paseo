@@ -60,6 +60,7 @@ import {
 } from "./diagnostic-utils.js";
 import { runProviderTurn } from "./provider-runner.js";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
+import { composeSystemPromptParts } from "../system-prompt.js";
 import {
   createSdkOpenCodeClient,
   type OpenCodeRuntime,
@@ -960,7 +961,10 @@ interface OpenCodeAgentClientDeps {
 class ProductionOpenCodeRuntime implements OpenCodeRuntime {
   constructor(private readonly serverManager: OpenCodeServerManager) {}
 
-  async acquireServer(options: { force: boolean }): Promise<OpenCodeServerAcquisition> {
+  async acquireServer(options: {
+    force: boolean;
+    env?: Record<string, string>;
+  }): Promise<OpenCodeServerAcquisition> {
     return this.serverManager.acquire(options);
   }
 
@@ -1006,7 +1010,10 @@ export class OpenCodeAgentClient implements AgentClient {
     options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
     const openCodeConfig = this.assertConfig(config);
-    const acquisition = await this.runtime.acquireServer({ force: false });
+    const acquisition = await this.runtime.acquireServer({
+      force: false,
+      env: launchContext?.env,
+    });
     const { url } = acquisition.server;
     const client = this.runtime.createClient({
       baseUrl: url,
@@ -2589,6 +2596,10 @@ class OpenCodeAgentSession implements AgentSession {
           partTypes: parts.map((p) => p.type),
         });
         try {
+          const systemPrompt = composeSystemPromptParts(
+            this.config.systemPrompt,
+            this.config.daemonAppendSystemPrompt,
+          );
           const promptResponse = await this.client.session.promptAsync({
             sessionID: this.sessionId,
             directory: this.config.cwd,
@@ -2601,7 +2612,7 @@ class OpenCodeAgentSession implements AgentSession {
                   },
                 }
               : {}),
-            ...(this.config.systemPrompt ? { system: this.config.systemPrompt } : {}),
+            ...(systemPrompt ? { system: systemPrompt } : {}),
             ...(model ? { model } : {}),
             ...(effectiveMode ? { agent: effectiveMode } : {}),
             ...(effectiveVariant ? { variant: effectiveVariant } : {}),

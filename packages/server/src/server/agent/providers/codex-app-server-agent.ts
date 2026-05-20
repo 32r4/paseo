@@ -41,6 +41,7 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
+import { composeSystemPromptParts } from "../system-prompt.js";
 import { curateAgentActivity } from "../activity-curator.js";
 import {
   mapCodexRolloutToolCall,
@@ -52,7 +53,7 @@ import {
   resolveProviderCommandPrefix,
   type ProviderRuntimeSettings,
 } from "../provider-launch-config.js";
-import { findExecutable, isCommandAvailable } from "../../../utils/executable.js";
+import { findExecutable, isCommandAvailable, probeExecutable } from "../../../utils/executable.js";
 import { createPathEquivalenceMatcher } from "../../../utils/path.js";
 import { spawnProcess } from "../../../utils/spawn.js";
 import { extractCodexTerminalSessionId, nonEmptyString } from "./tool-call-mapper-utils.js";
@@ -375,8 +376,61 @@ function mergeCodexConfiguredDefaults(
   };
 }
 
+function codexMicrosoftStorePackageRoot(): string | null {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) {
+    return null;
+  }
+  return path.join(localAppData, "Packages");
+}
+
+async function findCodexMicrosoftStoreBinary(): Promise<string | null> {
+  if (process.platform !== "win32") {
+    return null;
+  }
+
+  const packageRoot = codexMicrosoftStorePackageRoot();
+  if (!packageRoot) {
+    return null;
+  }
+
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(packageRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  const codexPackages = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("OpenAI.Codex_"))
+    .map((entry) => entry.name)
+    .sort();
+
+  for (const packageName of codexPackages) {
+    const candidate = path.join(
+      packageRoot,
+      packageName,
+      "LocalCache",
+      "Local",
+      "OpenAI",
+      "Codex",
+      "bin",
+      "codex.exe",
+    );
+    if (await probeExecutable(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+async function findDefaultCodexBinary(): Promise<string | null> {
+  return (await findExecutable("codex")) ?? (await findCodexMicrosoftStoreBinary());
+}
+
 async function resolveCodexBinary(): Promise<string> {
-  const found = await findExecutable("codex");
+  const found = await findDefaultCodexBinary();
   if (found) {
     return found;
   }
@@ -2973,12 +3027,11 @@ class CodexAppServerAgentSession implements AgentSession {
     const settings: Record<string, unknown> = {};
     if (match.model) settings.model = match.model;
     if (match.reasoning_effort) settings.reasoning_effort = match.reasoning_effort;
-    const developerInstructions = [
-      match.developer_instructions?.trim(),
-      this.config.systemPrompt?.trim(),
-    ]
-      .filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
-      .join("\n\n");
+    const developerInstructions = composeSystemPromptParts(
+      match.developer_instructions,
+      this.config.systemPrompt,
+      this.config.daemonAppendSystemPrompt,
+    );
     if (developerInstructions) settings.developer_instructions = developerInstructions;
     if (this.config.model) settings.model = this.config.model;
     const thinkingOptionId = normalizeCodexThinkingOptionId(this.config.thinkingOptionId);
@@ -3108,8 +3161,12 @@ class CodexAppServerAgentSession implements AgentSession {
         return;
       }
       const params: Record<string, unknown> = { threadId: this.currentThreadId };
-      if (this.config.systemPrompt?.trim()) {
-        params.developerInstructions = this.config.systemPrompt.trim();
+      const developerInstructions = composeSystemPromptParts(
+        this.config.systemPrompt,
+        this.config.daemonAppendSystemPrompt,
+      );
+      if (developerInstructions) {
+        params.developerInstructions = developerInstructions;
       }
       const codexConfig = this.buildCodexInnerConfig();
       if (codexConfig) {
@@ -3204,6 +3261,7 @@ class CodexAppServerAgentSession implements AgentSession {
     approvalPolicy: string;
     sandboxPolicyType: string;
     hasOutputSchema: boolean;
+    hasDeveloperInstructions: boolean;
     hasCodexConfig: boolean;
   }> {
     const input = await this.buildUserInput(prompt);
@@ -3246,8 +3304,12 @@ class CodexAppServerAgentSession implements AgentSession {
     if (options?.outputSchema) {
       params.outputSchema = normalizeCodexOutputSchema(options.outputSchema);
     }
-    if (this.config.systemPrompt?.trim()) {
-      params.developerInstructions = this.config.systemPrompt.trim();
+    const developerInstructions = composeSystemPromptParts(
+      this.config.systemPrompt,
+      this.config.daemonAppendSystemPrompt,
+    );
+    if (developerInstructions) {
+      params.developerInstructions = developerInstructions;
     }
     const codexConfig = this.buildCodexInnerConfig();
     if (codexConfig) {
@@ -3260,6 +3322,7 @@ class CodexAppServerAgentSession implements AgentSession {
       approvalPolicy,
       sandboxPolicyType,
       hasOutputSchema: Boolean(options?.outputSchema),
+      hasDeveloperInstructions: Boolean(developerInstructions),
       hasCodexConfig: Boolean(codexConfig),
     };
   }
@@ -3270,6 +3333,7 @@ class CodexAppServerAgentSession implements AgentSession {
     approvalPolicy,
     sandboxPolicyType,
     hasOutputSchema,
+    hasDeveloperInstructions,
     hasCodexConfig,
   }: {
     turnId: string;
@@ -3277,6 +3341,7 @@ class CodexAppServerAgentSession implements AgentSession {
     approvalPolicy: string;
     sandboxPolicyType: string;
     hasOutputSchema: boolean;
+    hasDeveloperInstructions: boolean;
     hasCodexConfig: boolean;
   }): void {
     this.logger.info(
@@ -3292,7 +3357,7 @@ class CodexAppServerAgentSession implements AgentSession {
         sandboxPolicyType,
         hasCollaborationMode: Boolean(this.resolvedCollaborationMode),
         hasOutputSchema,
-        hasDeveloperInstructions: Boolean(this.config.systemPrompt?.trim()),
+        hasDeveloperInstructions,
         hasCodexConfig,
       },
       "Starting Codex app-server turn",
@@ -3354,6 +3419,7 @@ class CodexAppServerAgentSession implements AgentSession {
         approvalPolicy: turnStart.approvalPolicy,
         sandboxPolicyType: turnStart.sandboxPolicyType,
         hasOutputSchema: turnStart.hasOutputSchema,
+        hasDeveloperInstructions: turnStart.hasDeveloperInstructions,
         hasCodexConfig: turnStart.hasCodexConfig,
       });
       await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
@@ -3899,14 +3965,16 @@ class CodexAppServerAgentSession implements AgentSession {
     const approvalPolicy = this.config.approvalPolicy ?? preset.approvalPolicy;
     const sandbox = this.config.sandboxMode ?? preset.sandbox;
     const innerConfig = this.buildCodexInnerConfig();
+    const developerInstructions = composeSystemPromptParts(
+      this.config.systemPrompt,
+      this.config.daemonAppendSystemPrompt,
+    );
     const params: Record<string, unknown> = {
       model,
       cwd: this.config.cwd ?? null,
       approvalPolicy,
       sandbox,
-      ...(this.config.systemPrompt?.trim()
-        ? { developerInstructions: this.config.systemPrompt.trim() }
-        : {}),
+      ...(developerInstructions ? { developerInstructions } : {}),
       ...(innerConfig ? { config: innerConfig } : {}),
       ...(this.ephemeral ? { ephemeral: true } : {}),
     };
@@ -5299,13 +5367,13 @@ export class CodexAppServerAgentClient implements AgentClient {
     if (command?.mode === "replace") {
       return await isCommandAvailable(command.argv[0]);
     }
-    return await isCommandAvailable("codex");
+    return (await findDefaultCodexBinary()) !== null;
   }
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     try {
       const available = await this.isAvailable();
-      const resolvedBinary = await findExecutable("codex");
+      const resolvedBinary = await findDefaultCodexBinary();
       const entries: Array<{ label: string; value: string }> = [
         {
           label: "Binary",
@@ -5448,6 +5516,8 @@ export const __codexAppServerInternals = {
   CodexAppServerClient,
   codexModelSupportsFastMode,
   CodexAppServerAgentSession,
+  findCodexMicrosoftStoreBinary,
+  findDefaultCodexBinary,
   formatCodexQuestionPrompts,
   mapCodexQuestionRequestToToolCall,
   mapCodexPatchNotificationToToolCall,

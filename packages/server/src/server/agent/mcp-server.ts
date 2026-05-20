@@ -3,7 +3,11 @@ import { z } from "zod";
 import { ensureValidJson } from "../json-utils.js";
 import type { Logger } from "pino";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  CallToolResult,
+  ServerNotification,
+  ServerRequest,
+} from "@modelcontextprotocol/sdk/types.js";
 
 import type { AgentProvider } from "./agent-sdk-types.js";
 import type { AgentManager, WaitForAgentResult } from "./agent-manager.js";
@@ -62,6 +66,7 @@ import {
   AgentModelSchema,
   AgentProviderEnum,
   AgentStatusEnum,
+  ProviderModeSchema,
   ProviderSummarySchema,
   parseDurationString,
   resolveRequiredProviderModel,
@@ -151,6 +156,54 @@ function mapModeAcrossProviders(
   }
 
   return sourceMode;
+}
+
+function addModelVisibleStructuredContent(result: CallToolResult): CallToolResult {
+  if (result.structuredContent === undefined || result.content.length > 0) {
+    return result;
+  }
+
+  return {
+    ...result,
+    content: [
+      {
+        type: "text",
+        text: formatStructuredContentForModel(result.structuredContent),
+      },
+    ],
+  };
+}
+
+function formatStructuredContentForModel(structuredContent: unknown): string {
+  if (
+    !structuredContent ||
+    typeof structuredContent !== "object" ||
+    Array.isArray(structuredContent)
+  ) {
+    return JSON.stringify(structuredContent, null, 2);
+  }
+
+  const record = structuredContent as Record<string, unknown>;
+  const summary: string[] = [];
+  for (const [key, value] of Object.entries(record)) {
+    if (!Array.isArray(value)) {
+      continue;
+    }
+    summary.push(`${key}_count=${value.length}`);
+    const ids = value
+      .map((item) =>
+        item && typeof item === "object" && !Array.isArray(item)
+          ? (item as Record<string, unknown>).id
+          : null,
+      )
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
+    if (ids.length === value.length && ids.length > 0) {
+      summary.push(`${key}_ids=${ids.join(",")}`);
+    }
+  }
+
+  const json = JSON.stringify(structuredContent, null, 2);
+  return summary.length > 0 ? `${summary.join("\n")}\n\n${json}` : json;
 }
 
 type McpToolContext = RequestHandlerExtra<ServerRequest, ServerNotification>;
@@ -453,6 +506,10 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     name: "agent-mcp",
     version: "2.0.0",
   });
+  const registerRawTool = server.registerTool.bind(server);
+  const registerTool: McpServer["registerTool"] = (name, config, handler) =>
+    registerRawTool(name, config, (async (args: never, extra: never) =>
+      addModelVisibleStructuredContent(await handler(args, extra))) as typeof handler);
 
   const resolveCallerAgent = () => {
     if (!callerAgentId) {
@@ -587,6 +644,55 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       },
       { message: "provider must be provider/model, for example codex/gpt-5.4" },
     );
+  const ProviderOrProviderModelInputSchema = AgentProviderEnum.trim()
+    .min(1, "provider is required")
+    .refine(
+      (value) => {
+        if (!value.includes("/")) {
+          return true;
+        }
+        try {
+          resolveRequiredProviderModel(value);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      { message: "provider must be provider or provider/model, for example codex/gpt-5.4" },
+    );
+  const CreateAgentSettingsInputSchema = z
+    .object({
+      modeId: z.string().optional().describe("Session mode to configure before the first run."),
+      thinkingOptionId: z.string().optional().describe("Thinking option ID."),
+      features: z
+        .record(z.unknown())
+        .optional()
+        .describe("Provider-specific feature values, for example { fast_mode: true } for Codex."),
+    })
+    .strict();
+  const UpdateAgentSettingsInputSchema = z
+    .object({
+      modeId: z.string().optional().describe("Session mode ID."),
+      model: z.string().nullable().optional().describe("Model ID. Pass null to clear."),
+      thinkingOptionId: z
+        .string()
+        .nullable()
+        .optional()
+        .describe("Thinking option ID. Pass null to clear."),
+      features: z
+        .record(z.unknown())
+        .optional()
+        .describe("Provider-specific feature values, for example { fast_mode: true } for Codex."),
+    })
+    .strict();
+  const InspectProviderSettingsInputSchema = z
+    .object({
+      modeId: z.string().optional().describe("Draft session mode ID."),
+      model: z.string().optional().describe("Draft model ID."),
+      thinkingOptionId: z.string().optional().describe("Draft thinking option ID."),
+      features: z.record(z.unknown()).optional().describe("Draft provider feature values."),
+    })
+    .strict();
   const agentToAgentInputSchema = {
     cwd: z
       .string()
@@ -601,23 +707,15 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     provider: ProviderModelInputSchema.describe(
       "Required provider/model pair, for example codex/gpt-5.4.",
     ),
-    thinking: z.string().optional().describe("Thinking option ID"),
-    features: z
-      .record(z.unknown())
-      .optional()
-      .describe("Provider-specific feature values, for example { fast_mode: true } for Codex."),
     labels: z.record(z.string(), z.string()).optional().describe("Labels to set on the agent"),
+    settings: CreateAgentSettingsInputSchema.optional().describe(
+      "Initial runtime settings for the new agent.",
+    ),
     initialPrompt: z
       .string()
       .trim()
       .min(1, "initialPrompt is required")
       .describe("Required first task to run immediately after creation."),
-    mode: z
-      .string()
-      .optional()
-      .describe(
-        "Optional session mode for the new agent. Required when the new agent uses a different provider than the caller agent.",
-      ),
     background: z
       .boolean()
       .optional()
@@ -647,21 +745,15 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     provider: ProviderModelInputSchema.describe(
       "Required provider/model pair, for example codex/gpt-5.4.",
     ),
-    thinking: z.string().optional().describe("Thinking option ID"),
-    features: z
-      .record(z.unknown())
-      .optional()
-      .describe("Provider-specific feature values, for example { fast_mode: true } for Codex."),
     labels: z.record(z.string(), z.string()).optional().describe("Labels to set on the agent"),
+    settings: CreateAgentSettingsInputSchema.optional().describe(
+      "Initial runtime settings for the new agent.",
+    ),
     initialPrompt: z
       .string()
       .trim()
       .min(1, "initialPrompt is required")
       .describe("Required first task to run immediately after creation."),
-    mode: z
-      .string()
-      .optional()
-      .describe("Optional session mode to configure before the first run."),
     worktreeName: z
       .string()
       .optional()
@@ -700,17 +792,21 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
   const createAgentInputSchema = callerAgentId ? agentToAgentInputSchema : topLevelInputSchema;
   const agentToAgentCreateAgentArgsSchema = z.object(agentToAgentInputSchema).strict();
   const topLevelCreateAgentArgsSchema = z.object(topLevelInputSchema).strict();
-  const listProviderFeaturesInputSchema = {
-    provider: AgentProviderEnum,
-    cwd: z.string().describe("Working directory used to resolve provider feature availability."),
-    modeId: z.string().optional(),
-    model: z.string().optional(),
-    thinkingOptionId: z.string().optional(),
-    featureValues: z.record(z.unknown()).optional(),
+  const inspectProviderInputSchema = {
+    provider: ProviderOrProviderModelInputSchema.describe(
+      "Provider ID, optionally with a model ID (for example codex or codex/gpt-5.4).",
+    ),
+    cwd: z
+      .string()
+      .optional()
+      .describe("Working directory used to resolve provider feature availability."),
+    settings: InspectProviderSettingsInputSchema.optional().describe(
+      "Draft provider settings used to compute available features.",
+    ),
   };
 
   if (options.voiceOnly || options.enableVoiceTools || callerContext?.enableVoiceTools) {
-    server.registerTool(
+    registerTool(
       "speak",
       {
         title: "Speak",
@@ -758,7 +854,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     background: boolean;
     normalizedTitle: string | null;
     model: string | undefined;
-    thinking: string | undefined;
+    thinkingOptionId: string | undefined;
     features: Record<string, unknown> | undefined;
     labels: Record<string, string> | undefined;
     notifyOnFinish: boolean;
@@ -805,6 +901,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       throw new Error(`Parent agent ${parentAgentId} not found`);
     }
     const provider = resolvedProviderModel.provider;
+    const settings = callerArgs.settings;
     const resolvedCwd = resolveChildAgentCwd({
       parentCwd: parentAgent.cwd,
       requestedCwd: callerArgs.cwd,
@@ -812,7 +909,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       allowCustomCwd: callerContext?.allowCustomCwd ?? true,
     });
     const resolvedMode = resolveAndValidateCreateAgentMode({
-      requestedMode: callerArgs.mode,
+      requestedMode: settings?.modeId,
       targetProvider: provider,
       parent: {
         provider: parentAgent.provider,
@@ -828,8 +925,8 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       background: callerArgs.background ?? false,
       normalizedTitle: callerArgs.title.trim(),
       model: resolvedProviderModel.model,
-      thinking: callerArgs.thinking,
-      features: callerArgs.features,
+      thinkingOptionId: settings?.thinkingOptionId,
+      features: settings?.features,
       labels: callerArgs.labels,
       notifyOnFinish: callerArgs.notifyOnFinish ?? false,
       resolvedCwd,
@@ -843,9 +940,10 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
   ): Promise<ResolvedCreateAgentArgs> => {
     const topLevelArgs = topLevelCreateAgentArgsSchema.parse(args);
     const resolvedProviderModel = resolveRequiredProviderModel(topLevelArgs.provider);
-    const { cwd, mode, worktreeName, baseBranch, refName, action, githubPrNumber } = topLevelArgs;
+    const { cwd, settings, worktreeName, baseBranch, refName, action, githubPrNumber } =
+      topLevelArgs;
     const resolvedMode = resolveAndValidateCreateAgentMode({
-      requestedMode: mode,
+      requestedMode: settings?.modeId,
       targetProvider: resolvedProviderModel.provider,
       parent: null,
       availableModes: getAvailableModeIds(resolvedProviderModel.provider),
@@ -902,8 +1000,8 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       background: topLevelArgs.background ?? false,
       normalizedTitle: topLevelArgs.title.trim(),
       model: resolvedProviderModel.model,
-      thinking: topLevelArgs.thinking,
-      features: topLevelArgs.features,
+      thinkingOptionId: settings?.thinkingOptionId,
+      features: settings?.features,
       labels: topLevelArgs.labels,
       notifyOnFinish: topLevelArgs.notifyOnFinish ?? false,
       resolvedCwd,
@@ -912,7 +1010,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     };
   };
 
-  server.registerTool(
+  registerTool(
     "create_agent",
     {
       title: "Create agent",
@@ -946,7 +1044,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         background,
         normalizedTitle,
         model,
-        thinking,
+        thinkingOptionId,
         features,
         labels,
         notifyOnFinish,
@@ -968,7 +1066,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
           modeId: resolvedMode,
           title: normalizedTitle ?? undefined,
           model,
-          thinkingOptionId: thinking,
+          thinkingOptionId,
           featureValues: features,
         },
         undefined,
@@ -1057,30 +1155,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
-    "set_agent_feature",
-    {
-      title: "Set agent feature",
-      description: "Set a provider-specific feature on an existing agent, such as Codex fast_mode.",
-      inputSchema: {
-        agentId: z.string(),
-        featureId: z.string().trim().min(1),
-        value: z.unknown(),
-      },
-      outputSchema: {
-        success: z.boolean(),
-      },
-    },
-    async ({ agentId, featureId, value }) => {
-      await agentManager.setAgentFeature(agentId, featureId, value);
-      return {
-        content: [],
-        structuredContent: ensureValidJson({ success: true }),
-      };
-    },
-  );
-
-  server.registerTool(
+  registerTool(
     "wait_for_agent",
     {
       title: "Wait for agent",
@@ -1157,7 +1232,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "send_agent_prompt",
     {
       title: "Send agent prompt",
@@ -1258,7 +1333,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "get_agent_status",
     {
       title: "Get agent status",
@@ -1308,7 +1383,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "list_agents",
     {
       title: "List agents",
@@ -1367,7 +1442,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "cancel_agent",
     {
       title: "Cancel agent run",
@@ -1391,7 +1466,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "archive_agent",
     {
       title: "Archive agent",
@@ -1414,7 +1489,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "kill_agent",
     {
       title: "Kill agent",
@@ -1436,21 +1511,39 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "update_agent",
     {
       title: "Update agent",
-      description: "Update an agent name and/or labels.",
+      description: "Update an agent name, labels, and/or runtime settings.",
       inputSchema: {
         agentId: z.string(),
         name: z.string().optional(),
         labels: z.record(z.string(), z.string()).optional().describe("Labels to set on the agent"),
+        settings: UpdateAgentSettingsInputSchema.optional().describe(
+          "Runtime settings to apply to the agent.",
+        ),
       },
       outputSchema: {
         success: z.boolean(),
       },
     },
-    async ({ agentId, name, labels }) => {
+    async ({ agentId, name, labels, settings }) => {
+      if (settings?.modeId !== undefined) {
+        await agentManager.setAgentMode(agentId, settings.modeId);
+      }
+      if (settings?.model !== undefined) {
+        await agentManager.setAgentModel(agentId, settings.model);
+      }
+      if (settings?.thinkingOptionId !== undefined) {
+        await agentManager.setAgentThinkingOption(agentId, settings.thinkingOptionId);
+      }
+      if (settings?.features) {
+        for (const [featureId, value] of Object.entries(settings.features)) {
+          await agentManager.setAgentFeature(agentId, featureId, value);
+        }
+      }
+
       const trimmedName = name?.trim();
       if (trimmedName) {
         const record = await agentStorage.get(agentId);
@@ -1476,7 +1569,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "list_terminals",
     {
       title: "List terminals",
@@ -1524,7 +1617,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "create_terminal",
     {
       title: "Create terminal",
@@ -1559,7 +1652,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "kill_terminal",
     {
       title: "Kill terminal",
@@ -1590,7 +1683,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "capture_terminal",
     {
       title: "Capture terminal",
@@ -1634,7 +1727,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "send_terminal_keys",
     {
       title: "Send terminal keys",
@@ -1670,7 +1763,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "create_schedule",
     {
       title: "Create schedule",
@@ -1751,7 +1844,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "list_schedules",
     {
       title: "List schedules",
@@ -1776,7 +1869,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "inspect_schedule",
     {
       title: "Inspect schedule",
@@ -1799,7 +1892,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "pause_schedule",
     {
       title: "Pause schedule",
@@ -1824,7 +1917,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "resume_schedule",
     {
       title: "Resume schedule",
@@ -1849,7 +1942,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "delete_schedule",
     {
       title: "Delete schedule",
@@ -1874,7 +1967,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "update_schedule",
     {
       title: "Update schedule",
@@ -1936,7 +2029,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "schedule_logs",
     {
       title: "Schedule logs",
@@ -1961,7 +2054,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "list_providers",
     {
       title: "List providers",
@@ -1984,7 +2077,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "list_models",
     {
       title: "List models",
@@ -2021,38 +2114,71 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
-    "list_provider_features",
+  registerTool(
+    "inspect_provider",
     {
-      title: "List provider features",
+      title: "Inspect provider",
       description:
-        "List provider-specific features available for a draft agent configuration, such as Codex fast_mode.",
-      inputSchema: listProviderFeaturesInputSchema,
+        "Inspect compact provider capabilities for orchestration, including modes and draft feature settings. Use list_models for the full model list.",
+      inputSchema: inspectProviderInputSchema,
       outputSchema: {
         provider: AgentProviderEnum,
+        label: z.string().nullable().optional(),
+        description: z.string().nullable().optional(),
+        enabled: z.boolean(),
+        status: z.string(),
+        modes: z.array(ProviderModeSchema).nullish(),
+        selectedModel: z.string().nullable(),
         features: z.array(AgentFeatureSchema),
       },
     },
-    async ({ provider, cwd, modeId, model, thinkingOptionId, featureValues }) => {
-      const features = await agentManager.listDraftFeatures({
+    async ({ provider, cwd, settings }) => {
+      const resolvedProviderModel = resolveScheduleProviderAndModel({
         provider,
-        cwd: expandUserPath(cwd),
-        ...(modeId ? { modeId } : {}),
-        ...(model ? { model } : {}),
-        ...(thinkingOptionId ? { thinkingOptionId } : {}),
-        ...(featureValues ? { featureValues } : {}),
+        defaultProvider: provider,
+      });
+      const providerId = resolvedProviderModel.provider;
+      if (!providerRegistry) {
+        throw new Error("Provider registry is not configured");
+      }
+      const definition = providerRegistry[providerId];
+      if (!definition) {
+        throw new Error(`Provider ${providerId} is not configured`);
+      }
+      const summary = await resolveProviderSummary(definition, childLogger);
+      if (!definition.enabled) {
+        throw new Error(`Provider '${providerId}' is disabled`);
+      }
+      if (summary.status !== "available") {
+        throw new Error(summary.error ?? `Provider '${providerId}' is unavailable`);
+      }
+      const resolvedCwd = resolveScopedCwd(cwd, { required: true });
+      const selectedModel = settings?.model ?? resolvedProviderModel.model;
+      const features = await agentManager.listDraftFeatures({
+        provider: providerId,
+        cwd: resolvedCwd,
+        ...(settings?.modeId ? { modeId: settings.modeId } : {}),
+        ...(selectedModel ? { model: selectedModel } : {}),
+        ...(settings?.thinkingOptionId ? { thinkingOptionId: settings.thinkingOptionId } : {}),
+        ...(settings?.features ? { featureValues: settings.features } : {}),
       });
       return {
         content: [],
         structuredContent: ensureValidJson({
-          provider,
+          provider: providerId,
+          label: summary.label,
+          description: summary.description,
+          enabled: summary.enabled,
+          status: summary.status,
+          modes: summary.modes,
+          selectedModel: selectedModel ?? null,
           features,
         }),
       };
     },
   );
 
-  server.registerTool(
+  registerTool(
     "list_worktrees",
     {
       title: "List worktrees",
@@ -2083,7 +2209,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "create_worktree",
     {
       title: "Create worktree",
@@ -2148,7 +2274,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "archive_worktree",
     {
       title: "Archive worktree",
@@ -2240,7 +2366,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "get_agent_activity",
     {
       title: "Get agent activity",
@@ -2296,7 +2422,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "set_agent_mode",
     {
       title: "Set agent session mode",
@@ -2320,7 +2446,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "list_pending_permissions",
     {
       title: "List pending permissions",
@@ -2354,7 +2480,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     },
   );
 
-  server.registerTool(
+  registerTool(
     "respond_to_permission",
     {
       title: "Respond to permission",
